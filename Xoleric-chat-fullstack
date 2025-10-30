@@ -1,0 +1,104 @@
+// Full-stack Chat App (Node.js + Express + Socket.io + SQLite) // Single-repo layout provided in one file for easy copy-paste deployment. // Files included below (separated by comments): // 1) package.json // 2) schema.sql // 3) server.js // 4) public/index.html (frontend) // 5) README instructions
+
+/* ---------------- package.json ---------------- / / Save as package.json */ { "name": "xoleric-chat", "version": "1.0.0", "main": "server.js", "scripts": { "start": "node server.js" }, "dependencies": { "better-sqlite3": "^8.3.0", "express": "^4.18.2", "socket.io": "^4.7.2", "uuid": "^9.0.0", "sanitize-html": "^2.10.1" } }
+
+/* ---------------- schema.sql ---------------- / / Save as schema.sql and run once (server will auto-init if not present) */ -- Users CREATE TABLE IF NOT EXISTS users ( id TEXT PRIMARY KEY, username TEXT UNIQUE, display_name TEXT, created_at INTEGER );
+
+-- Chats (private P2P chats or channels) CREATE TABLE IF NOT EXISTS chats ( id TEXT PRIMARY KEY, title TEXT, is_channel INTEGER DEFAULT 0, created_by TEXT, created_at INTEGER, deleted INTEGER DEFAULT 0 );
+
+-- Chat members (for channels / group persistency) CREATE TABLE IF NOT EXISTS chat_members ( chat_id TEXT, user_id TEXT, role TEXT DEFAULT 'member', PRIMARY KEY(chat_id, user_id) );
+
+-- Messages CREATE TABLE IF NOT EXISTS messages ( id TEXT PRIMARY KEY, chat_id TEXT, sender_id TEXT, content TEXT, created_at INTEGER, deleted INTEGER DEFAULT 0 );
+
+-- Fulltext index for messages to power global search (FTS5) CREATE VIRTUAL TABLE IF NOT EXISTS messages_fts USING fts5(id, chat_id, sender_id, content);
+
+/* ---------------- server.js ---------------- / / Save as server.js */ const express = require('express'); const http = require('http'); const { Server } = require('socket.io'); const Database = require('better-sqlite3'); const { v4: uuidv4 } = require('uuid'); const fs = require('fs'); const path = require('path'); const sanitizeHtml = require('sanitize-html');
+
+const DB_FILE = path.join(__dirname, 'data.sqlite'); const db = new Database(DB_FILE);
+
+// Auto-init schema if not exists const schema = fs.readFileSync(path.join(__dirname, 'schema.sql'), 'utf8'); db.exec(schema);
+
+const app = express(); const server = http.createServer(app); const io = new Server(server);
+
+app.use(express.static(path.join(__dirname, 'public'))); app.use(express.json({ limit: '1mb' }));
+
+/*********************** Helpers ************************/nfunction now(){return Date.now();} function sanitize(text){ return sanitizeHtml(text, { allowedTags:[], allowedAttributes: {} }).trim(); }
+
+// Levenshtein for suggestion if search misses function levenshtein(a,b){ if(a===b) return 0; const al=a.length, bl=b.length; if(al===0) return bl; if(bl===0) return al; let v0=new Array(bl+1), v1=new Array(bl+1); for(let i=0;i<=bl;i++) v0[i]=i; for(let i=0;i<al;i++){ v1[0]=i+1; for(let j=0;j<bl;j++){ const cost = a[i]===b[j]?0:1; v1[j+1]=Math.min(v1[j]+1, v0[j+1]+1, v0[j]+cost); } v0=Array.from(v1); } return v0[bl]; }
+
+/*********************** DB Statements ******************/nconst addUserStmt = db.prepare('INSERT OR IGNORE INTO users(id, username, display_name, created_at) VALUES(?,?,?,?)'); const getUserById = db.prepare('SELECT * FROM users WHERE id=?'); const getUserByName = db.prepare('SELECT * FROM users WHERE username=?');
+
+const createChatStmt = db.prepare('INSERT INTO chats(id, title, is_channel, created_by, created_at) VALUES(?,?,?,?,?)'); const getChatById = db.prepare('SELECT * FROM chats WHERE id=?'); const addMemberStmt = db.prepare('INSERT OR IGNORE INTO chat_members(chat_id, user_id, role) VALUES(?,?,?)');
+
+const addMessageStmt = db.prepare('INSERT INTO messages(id, chat_id, sender_id, content, created_at, deleted) VALUES(?,?,?,?,?,0)'); const addMessageFts = db.prepare('INSERT INTO messages_fts(id, chat_id, sender_id, content) VALUES(?,?,?,?)'); const getMessagesByChat = db.prepare('SELECT * FROM messages WHERE chat_id=? AND deleted=0 ORDER BY created_at ASC LIMIT 1000');
+
+const searchFts = db.prepare("SELECT id, chat_id, content FROM messages_fts WHERE messages_fts MATCH ? LIMIT 100;");
+
+/*********************** REST API ************************/n// Simple user create/login (no password for demo) -- username must be unique app.post('/api/user', (req,res)=>{ let { username, display_name } = req.body; if(!username) return res.status(400).json({error:'username required'}); username = username.toLowerCase().replace(/[^a-z0-9_-.]/g,'').slice(0,32); const id = uuidv4(); addUserStmt.run(id, username, display_name||username, now()); const user = getUserByName.get(username); res.json({user}); });
+
+// Create chat (private P2P or channel) app.post('/api/chat', (req,res)=>{ const { title, is_channel, creator_id, member_ids } = req.body; const id = uuidv4(); createChatStmt.run(id, title||null, is_channel?1:0, creator_id||null, now()); if(Array.isArray(member_ids)){ const insert = db.prepare('INSERT OR IGNORE INTO chat_members(chat_id, user_id, role) VALUES(?,?,?)'); const insertMany = db.transaction((rows)=>{ for(const u of rows) insert.run(id, u, 'member'); }); insertMany(member_ids); } res.json({chat_id:id}); });
+
+// Get messages app.get('/api/chat/:id/messages', (req,res)=>{ const id = req.params.id; const msgs = getMessagesByChat.all(id); res.json({messages: msgs}); });
+
+// Send message (also emits to Socket.io) app.post('/api/chat/:id/message', (req,res)=>{ const id = req.params.id; const { sender_id, content } = req.body; const clean = sanitize(content||''); const mid = uuidv4(); addMessageStmt.run(mid, id, sender_id||null, clean, now()); addMessageFts.run(mid, id, sender_id||null, clean); // broadcast via socket io.to(id).emit('message', {id:mid, chat_id:id, sender_id, content:clean, created_at: now()}); res.json({ok:true, id:mid}); });
+
+// Global search with fuzzy fallback app.get('/api/search', (req,res)=>{ const q = (req.query.q||'').trim(); if(!q) return res.json({results: []}); // primary: FTS5 search try{ const rows = searchFts.all(q + '*'); if(rows.length>0) return res.json({results: rows}); // fallback: brute-force small fuzzy over recent message contents const recent = db.prepare('SELECT id, content FROM messages ORDER BY created_at DESC LIMIT 1000').all(); let best = []; for(const r of recent){ const dist = levenshtein(q.toLowerCase(), (r.content||'').toLowerCase().slice(0,100)); best.push({id:r.id, content:r.content, dist}); } best.sort((a,b)=>a.dist-b.dist); const suggestions = best.slice(0,6).map(s=>({id:s.id, content:s.content, score: 1 - s.dist/Math.max(q.length,10)})); return res.json({results: [], suggestions}); }catch(e){ console.error(e); return res.status(500).json({error:'search failed'}); } });
+
+/*********************** Socket.io (signaling & realtime) ******************/nio.on('connection', (socket) => { // Join chat room socket.on('join', ({chat_id, user_id}) => { socket.join(chat_id); socket.data.user_id = user_id; socket.to(chat_id).emit('presence', {user_id, status:'joined'}); });
+
+// Leave socket.on('leave', ({chat_id, user_id}) => { socket.leave(chat_id); socket.to(chat_id).emit('presence', {user_id, status:'left'}); });
+
+// Signaling for WebRTC P2P socket.on('signal', ({chat_id, to, data}) => { // data contains offer/answer/ice io.to(to).emit('signal', {from: socket.id, chat_id, data}); });
+
+// Chat messages via socket socket.on('message', (msg) => { // msg: {chat_id, sender_id, content} const clean = sanitize(msg.content||''); const mid = uuidv4(); addMessageStmt.run(mid, msg.chat_id, msg.sender_id||null, clean, now()); addMessageFts.run(mid, msg.chat_id, msg.sender_id||null, clean); io.to(msg.chat_id).emit('message', {id:mid, chat_id:msg.chat_id, sender_id:msg.sender_id, content:clean, created_at: now()}); });
+
+socket.on('disconnect', ()=>{ /* handle if needed */ }); });
+
+/*********************** Utility: create a quick public P2P link ******************/napp.get('/api/new_p2p', (req,res)=>{ const chatId = uuidv4(); createChatStmt.run(chatId, null, 0, null, now()); // no members until someone joins; messages kept until deleted res.json({chat_id: chatId, url: /room/${chatId}}); });
+
+// Serve room page (frontend handles /room/:id) app.get('/room/:id', (req,res)=>{ res.sendFile(path.join(__dirname, 'public','index.html')); });
+
+/*********************** Start server ************************/nconst PORT = process.env.PORT || 3000; server.listen(PORT, ()=>console.log('Server running on', PORT));
+
+/* ---------------- public/index.html ---------------- / / Save as public/index.html */ 
+
+Xoleric Chat (Demo) :root{ --bg:#0b0b0b; --fg:#fff; --muted:#999; --accent:#fff } html,body{height:100%;margin:0;background:var(--bg);color:var(--fg);font-family:Inter,Arial,Helvetica,sans-serif} .app{display:flex;height:100vh} .sidebar{width:320px;border-right:1px solid #111;padding:16px;box-sizing:border-box} .main{flex:1;display:flex;flex-direction:column} .chats{overflow:auto;height:calc(100vh - 160px)} .chat-item{padding:10px;border-radius:8px;margin-bottom:8px;background:transparent;cursor:pointer} .chat-item:hover{background:#111} .header{display:flex;justify-content:space-between;align-items:center} .compose{display:flex;gap:8px;padding:12px} .messages{flex:1;overflow:auto;padding:16px} .msg{margin-bottom:12px} .msg .who{font-size:12px;color:var(--muted)} .msg .text{background:#111;padding:10px;border-radius:8px;display:inline-block} .controls{display:flex;gap:8px;padding:12px;border-top:1px solid #111} input,button,select{background:transparent;border:1px solid #222;color:var(--fg);padding:8px;border-radius:6px} button.primary{background:var(--fg);color:var(--bg);border:none} .small{font-size:13px;color:var(--muted)} @media (max-width:720px){ .sidebar{display:none} } 
+
+Xoleric Chat
+
+Minimal P2P + Relay demo
+
+New Link
+
+<div style="margin-top:12px"> <input id="username" placeholder="username (no pass)" /> <button id="btnLogin">Login</button> </div> <div style="margin-top:12px"> <div style="display:flex;gap:8px"> <input id="searchQ" placeholder="Global search..." /> <button id="btnSearch">Qidir</button> </div> <div id="searchResults" class="small" style="margin-top:8px"></div> </div> <div style="margin-top:12px;font-weight:600">Chats</div> <div class="chats" id="chatsList"></div> </div> <div class="main"> <div style="padding:12px;border-bottom:1px solid #111;display:flex;justify-content:space-between;align-items:center"> <div id="roomTitle">No chat selected</div> <div class="small">Link: <span id="roomLink">-</span></div> </div> <div class="messages" id="messages"></div> <div class="controls"> <input id="msgInput" placeholder="Type message or paste room link to join..." style="flex:1" /> <button id="btnSend" class="primary">Send</button> </div> </div> 
+
+const socket = io(); let me = null; let currentChat = null; async function api(path, opts={}){ const res = await fetch('/api'+path, opts); return res.json(); } // Login (create user) document.getElementById('btnLogin').onclick = async ()=>{ const username = document.getElementById('username').value.trim(); if(!username) return alert('username required'); const r = await api('/user',{method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({username})}); me = r.user; loadChats(); } async function loadChats(){ // For demo: show recent chats from DB const res = await fetch('/api/search?q=*'); // we won't rely on search for list; this demo keeps a simple list via server-side: recent messages const recent = await fetch('/api/search?q='); } // Create new P2P link document.getElementById('btnNewP2P').onclick = async ()=>{ const r = await api('/new_p2p'); const url = location.origin + r.url; navigator.clipboard.writeText(url).catch(()=>{}); alert('P2P link created and copied: ' + url); } // Send message (via socket, stored on server) document.getElementById('btnSend').onclick = async ()=>{ const text = document.getElementById('msgInput').value.trim(); if(!text) return; // if text looks like a room link join if(text.includes('/room/')){ const parts = text.split('/room/'); const id = parts[1].split(/[\s\?#]/)[0]; joinRoom(id); document.getElementById('msgInput').value=''; return; } if(!currentChat) return alert('Select or join a chat first (paste room link)'); socket.emit('message',{chat_id: currentChat, sender_id: me?me.id:null, content: text}); document.getElementById('msgInput').value=''; } // Receive message socket.on('message', (m)=>{ if(!m || !m.chat_id) return; if(m.chat_id !== currentChat){ // show as unread in list (not implemented fully) // TODO: mark unread } if(m.chat_id === currentChat) renderMessage(m); }); function renderMessage(m){ const wrap = document.getElementById('messages'); const d = document.createElement('div'); d.className='msg'; const who = document.createElement('div'); who.className='who'; who.textContent = m.sender_id || 'anon'; const txt = document.createElement('div'); txt.className='text'; txt.textContent = m.content; d.appendChild(who); d.appendChild(txt); wrap.appendChild(d); wrap.scrollTop = wrap.scrollHeight; } async function joinRoom(id){ currentChat = id; document.getElementById('roomTitle').textContent = 'Chat: ' + id; document.getElementById('roomLink').textContent = location.origin + '/room/' + id; socket.emit('join', {chat_id: id, user_id: me?me.id:null}); // load existing messages const r = await api('/chat/' + id + '/messages'); const container = document.getElementById('messages'); container.innerHTML=''; r.messages.forEach(renderMessage); // attempt to establish P2P: signaling via socket // For brevity: full WebRTC handshake not implemented in this simple demo. Server supports signaling via 'signal' event. } // Global search document.getElementById('btnSearch').onclick = async ()=>{ const q = document.getElementById('searchQ').value.trim(); if(!q) return; const res = await api('/search?q='+encodeURIComponent(q)); const box = document.getElementById('searchResults'); box.innerHTML=''; if(res.results && res.results.length){ for(const r of res.results) { const el=document.createElement('div'); el.textContent = r.content.slice(0,200); box.appendChild(el); } } else if(res.suggestions){ box.textContent = 'No exact results. Suggestions:'; res.suggestions.forEach(s=>{ const el=document.createElement('div'); el.textContent = s.content.slice(0,200); box.appendChild(el); }); } else box.textContent='No results'; } // If opened via /room/:id, auto-join const path = location.pathname.split('/'); if(path[1]=='room' && path[2]){ const rid = path[2]; setTimeout(()=>{ joinRoom(rid); }, 300); } 
+
+/* ---------------- README ---------------- / / Save as README.md */
+
+Xoleric Chat - Demo Fullstack
+
+This is a single-repo demo of a chat application combining:
+
+Express + Socket.io signaling and realtime
+
+SQLite (better-sqlite3) relational store + FTS5 for search
+
+P2P room link generation + persistence
+
+Global search with fuzzy suggestion fallback
+
+How to run
+
+Save files: package.json, schema.sql, server.js, public/index.html, README.md
+
+npm install
+
+npm start
+
+Open http://localhost:3000 in browser
+
+Notes: This is a demo foundation. For production you must add authentication, HTTPS, rate-limiting, input validation, and stronger security.
+
+/* End of bundled files */
+
